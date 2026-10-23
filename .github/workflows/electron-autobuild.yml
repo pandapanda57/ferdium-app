@@ -4,7 +4,8 @@ name: Electron auto-build
 #   - New patch of the Electron major Ferdium ships with -> normal release (safe to install)
 #   - Newer Electron major                               -> one pre-release marked TEST per major
 #   - TEST build fails                                   -> issue; that major is not retried
-#                                                           (delete the issue to allow a retry)
+#                                                           while the issue is open (close it to retry)
+# TEST builds also use the newest node-abi, so electron-builder recognises new Electron majors.
 #   - Ferdium's Electron major near/at end of support    -> issue in this repo
 # Installing is always manual: these builds are unsigned.
 
@@ -61,7 +62,7 @@ jobs:
 
           # Skip anything already released in this repo; TEST builds only once per Electron major
           RELEASED=$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')
-          FAILED=$(gh issue list --repo "$REPO" --state all --limit 1000 --json title --jq '.[].title | select(startswith("TEST build failed:"))')
+          FAILED=$(gh issue list --repo "$REPO" --state open --limit 1000 --json title --jq '.[].title | select(startswith("TEST build failed:"))')
           TARGETS='[]'
           for row in $(jq -c '.targets[]' plan.json); do
             t=$(jq -r .tag <<<"$row")
@@ -154,6 +155,15 @@ jobs:
       - name: Switch to Electron ${{ matrix.electron }}
         run: npm pkg set "devDependencies.electron=${{ matrix.electron }}"
         shell: bash
+      # Ferdium's pinned node-abi may predate a new Electron major; electron-builder then fails
+      # with "Could not detect abi". Patch builds keep Ferdium's own version.
+      - name: Use newest node-abi (TEST builds only)
+        if: matrix.kind == 'test'
+        run: |
+          V=$(npm view node-abi version)
+          sed -i "/^overrides:/a\\  node-abi: $V" pnpm-workspace.yaml
+          echo "node-abi override: $V"
+        shell: bash
       - name: Install node dependencies
         uses: nick-fields/retry@v3
         with:
@@ -161,6 +171,9 @@ jobs:
           timeout_minutes: 15
           max_attempts: 3
           retry_on: error
+      - name: Show node-abi in use
+        run: grep -oE "node-abi@[0-9.]+" pnpm-lock.yaml | sort -u
+        shell: bash
       - name: Package recipes
         run: |
           pnpm i
@@ -213,5 +226,5 @@ jobs:
           FERDIUM="${{ matrix.ferdium }}"; ELECTRON="${{ matrix.electron }}"; MAJOR="${ELECTRON%%.*}"
           TITLE="TEST build failed: Ferdium ${FERDIUM#v} + Electron $ELECTRON"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          printf 'The TEST build of Ferdium %s on Electron %s failed, so no TEST release was published.\n\nElectron %s will not be TEST-built again while this issue exists, open or closed. Delete this issue to allow a retry.\n\nBuild log: %s\n' "${FERDIUM#v}" "$ELECTRON" "$MAJOR" "$RUN_URL" > issue.md
+          printf 'The TEST build of Ferdium %s on Electron %s failed, so no TEST release was published.\n\nElectron %s will not be TEST-built again while this issue is open. Close it to allow a retry.\n\nBuild log: %s\n' "${FERDIUM#v}" "$ELECTRON" "$MAJOR" "$RUN_URL" > issue.md
           gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body-file issue.md
