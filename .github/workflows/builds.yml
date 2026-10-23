@@ -384,7 +384,7 @@ jobs:
       - name: Install node dependencies
         uses: nick-fields/retry@v3
         with:
-          command: pnpm i
+          command: pnpm i --no-frozen-lockfile
           timeout_minutes: 15
           max_attempts: 3
           retry_on: error
