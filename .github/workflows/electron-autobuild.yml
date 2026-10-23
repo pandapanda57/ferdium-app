@@ -1,0 +1,197 @@
+name: Electron auto-build
+
+# Rebuilds the newest official Ferdium release on every new Electron version.
+#   - New patch of the Electron major Ferdium ships with -> normal release (safe to install)
+#   - Newer Electron major                               -> pre-release marked TEST
+#   - Ferdium's Electron major near/at end of support    -> issue in this repo
+# Installing is always manual: these builds are unsigned.
+
+on:
+  schedule:
+    - cron: '23 */6 * * *' # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: electron-autobuild
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Work out what needs building
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          FERDIUM_TAG=$(gh api repos/ferdium/ferdium-app/releases/latest --jq .tag_name)
+          SHIPPED=$(gh api "repos/ferdium/ferdium-app/contents/package.json?ref=$FERDIUM_TAG" --jq .content | base64 -d | jq -r .devDependencies.electron)
+          npm view electron versions --json > versions.json
+          export FERDIUM_TAG SHIPPED
+          node > plan.json <<'EOF'
+          const fs = require('fs');
+          const parse = v => v.split('.').map(Number);
+          const cmp = (a, b) => { const x = parse(a), y = parse(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
+          const stable = JSON.parse(fs.readFileSync('versions.json')).filter(v => /^\d+\.\d+\.\d+$/.test(v)).sort(cmp);
+          const shipped = process.env.SHIPPED, tag = process.env.FERDIUM_TAG;
+          const M = parse(shipped)[0];
+          const L = parse(stable[stable.length - 1])[0];
+          const newest = major => stable.filter(v => parse(v)[0] === major).pop();
+          const targets = [];
+          const patch = newest(M);
+          if (cmp(patch, shipped) > 0) targets.push({ electron: patch, kind: 'patch' });
+          if (L > M) targets.push({ electron: newest(L), kind: 'test' });
+          for (const t of targets) { t.ferdium = tag; t.tag = `ferdium-${tag}-electron-${t.electron}`; }
+          console.log(JSON.stringify({ shipped, M, L, targets }));
+          EOF
+          cat plan.json
+          M=$(jq -r .M plan.json); L=$(jq -r .L plan.json)
+
+          # Skip anything already released in this repo
+          TARGETS='[]'
+          for row in $(jq -c '.targets[]' plan.json); do
+            t=$(jq -r .tag <<<"$row")
+            if gh release view "$t" --repo "$REPO" >/dev/null 2>&1; then
+              echo "Already built: $t"
+            else
+              echo "To build: $t"
+              TARGETS=$(jq -c --argjson r "$row" '. + [$r]' <<<"$TARGETS")
+            fi
+          done
+          echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+          echo "M=$M" >> "$GITHUB_ENV"
+          echo "L=$L" >> "$GITHUB_ENV"
+
+      - name: Warn when Ferdium's Electron major is near end of support
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Electron supports its latest three stable majors.
+          if [ "$M" -lt $((L - 2)) ]; then
+            TITLE="Electron $M is no longer supported"
+            BODY="Official Ferdium still ships Electron $M, but Electron now only patches $((L - 2))-$L. Patch builds have stopped; use the newest TEST build or wait for a Ferdium release on a supported Electron."
+          elif [ "$M" -eq $((L - 2)) ]; then
+            TITLE="Electron $M support ends when Electron $((L + 1)) ships"
+            BODY="Official Ferdium ships Electron $M, the oldest major Electron still patches. Dates: https://releases.electronjs.org/schedule"
+          else
+            exit 0
+          fi
+          if [ "$(gh issue list --repo "$REPO" --state open --search "in:title \"$TITLE\"" --json number --jq length)" = "0" ]; then
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Keep the schedule alive
+        # GitHub pauses schedules in public repos after 60 days without a commit.
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
+          LAST=$(gh api "repos/$REPO/git/commits/$HEAD" --jq .committer.date)
+          AGE_DAYS=$(( ($(date +%s) - $(date -d "$LAST" +%s)) / 86400 ))
+          echo "Last commit $AGE_DAYS days ago"
+          if [ "$AGE_DAYS" -ge 45 ]; then
+            TREE=$(gh api "repos/$REPO/git/commits/$HEAD" --jq .tree.sha)
+            NEW=$(gh api "repos/$REPO/git/commits" -f message="keepalive: stop GitHub pausing the auto-build schedule" -f tree="$TREE" -f "parents[]=$HEAD" --jq .sha)
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$DEFAULT_BRANCH" -f sha="$NEW" >/dev/null
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.targets != '[]'
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check.outputs.targets) }}
+    name: 'Ferdium ${{ matrix.ferdium }} + Electron ${{ matrix.electron }} (${{ matrix.kind }})'
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Set env vars
+        run: |
+          echo "HOME=$USERPROFILE" >> $GITHUB_ENV
+          echo "ELECTRON_CACHE=$USERPROFILE/.cache/electron" >> $GITHUB_ENV
+          echo "ELECTRON_BUILDER_CACHE=$USERPROFILE/.cache/electron-builder" >> $GITHUB_ENV
+        shell: bash
+      - name: Checkout official Ferdium release
+        uses: actions/checkout@v4
+        with:
+          repository: ferdium/ferdium-app
+          ref: ${{ matrix.ferdium }}
+          submodules: recursive
+      - name: Use Node.js specified in the '.nvmrc' file
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+      # Same workaround as Ferdium's own build (electron-builder issue 6933)
+      - name: Tweak pnpm.cjs
+        run: |
+          PNPM_BASEDIR=$(dirname "$(echo "$PNPM_HOME" | sed -e 's/\\/\//g' -e 's/^\([A-Za-z]\):/\/\1/')")
+          sed -i 's/\/usr\/bin\/env node/node/g' "$PNPM_BASEDIR/pnpm/bin/pnpm.cjs"
+        shell: bash
+      - name: Switch to Electron ${{ matrix.electron }}
+        run: npm pkg set "devDependencies.electron=${{ matrix.electron }}"
+        shell: bash
+      - name: Install node dependencies
+        uses: nick-fields/retry@v3
+        with:
+          command: pnpm i --no-frozen-lockfile
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_on: error
+      - name: Package recipes
+        run: |
+          pnpm i
+          pnpm lint
+          pnpm reformat-files
+          pnpm package
+        working-directory: ./recipes
+        shell: bash
+      - name: Run linter and tests
+        run: |
+          pnpm lint
+          pnpm test
+        shell: bash
+      - name: Build Ferdium
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: pnpm build --publish never
+        shell: bash
+      - name: Confirm the packaged Electron version
+        shell: pwsh
+        run: |
+          $txt = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes('out\win-unpacked\Ferdium.exe'))
+          $found = [regex]::Matches($txt, 'Electron/(\d+\.\d+\.\d+)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+          "Packaged Electron: $found"
+          if ($found -ne '${{ matrix.electron }}') { throw "Expected Electron ${{ matrix.electron }}, found $found" }
+      - name: Publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+          FERDIUM="${{ matrix.ferdium }}"; ELECTRON="${{ matrix.electron }}"
+          if [ "${{ matrix.kind }}" = "test" ]; then
+            TITLE="TEST - Ferdium ${FERDIUM#v} + Electron $ELECTRON"
+            FLAGS="--prerelease"
+            NOTE="TEST build: Electron $ELECTRON is a newer major version than official Ferdium ${FERDIUM#v} was built for. Some services may break. Try it before relying on it."
+          else
+            TITLE="Ferdium ${FERDIUM#v} + Electron $ELECTRON"
+            FLAGS="--latest"
+            NOTE="Official Ferdium ${FERDIUM#v} source with Electron updated to $ELECTRON (security and bug-fix patch of the same major version)."
+          fi
+          printf '%s\n\nInstall: download Ferdium-win-AutoSetup-*-x64.exe and run it. The build is unsigned, so at the SmartScreen warning click More info, then Run anyway.\n\nBuilt from https://github.com/ferdium/ferdium-app/tree/%s with only the Electron version changed.\n' "$NOTE" "$FERDIUM" > notes.md
+          gh release create "${{ matrix.tag }}" out/Ferdium-win-AutoSetup-*-x64.exe \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.event.repository.default_branch }}" \
+            --title "$TITLE" --notes-file notes.md $FLAGS
