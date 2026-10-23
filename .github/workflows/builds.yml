@@ -26,8 +26,6 @@ on:
       message:
         description: 'Message for build'
         required: true
-  schedule:
-    - cron: '0 0 * * *' # every night at 12 am
 
 env:
   USE_HARD_LINKS: false
@@ -416,3 +414,9 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: false
         run: pnpm build --publish always
         shell: bash
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferdium-windows
+          path: out/*.exe
+          if-no-files-found: error
