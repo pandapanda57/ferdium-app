@@ -5,7 +5,8 @@ name: Electron auto-build
 #   - Newer Electron major                               -> one pre-release marked TEST per major
 #   - TEST build fails                                   -> issue; that major is not retried
 #                                                           while the issue is open (close it to retry)
-# TEST builds also use the newest node-abi, so electron-builder recognises new Electron majors.
+# TEST builds also use the newest node-abi, so electron-builder recognises new Electron majors,
+# and build Windows x64 only (Electron 45+ no longer publishes 32-bit Windows).
 #   - Ferdium's Electron major near/at end of support    -> issue in this repo
 # Installing is always manual: these builds are unsigned.
 
@@ -163,6 +164,13 @@ jobs:
           V=$(npm view node-abi version)
           sed -i "/^overrides:/a\\  node-abi: $V" pnpm-workspace.yaml
           echo "node-abi override: $V"
+        shell: bash
+      # Electron 45 dropped 32-bit Windows; only the x64 installer is published anyway.
+      - name: Build Windows x64 only (TEST builds only)
+        if: matrix.kind == 'test'
+        run: |
+          sed -i 's/arch: \[x64, ia32, arm64\]/arch: [x64]/' electron-builder.yml
+          grep -n "arch: \[x64\]" electron-builder.yml
         shell: bash
       - name: Install node dependencies
         uses: nick-fields/retry@v3
