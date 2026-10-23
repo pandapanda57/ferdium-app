@@ -2,7 +2,7 @@ name: Electron auto-build
 
 # Rebuilds the newest official Ferdium release on every new Electron version.
 #   - New patch of the Electron major Ferdium ships with -> normal release (safe to install)
-#   - Newer Electron major                               -> pre-release marked TEST
+#   - Newer Electron major                               -> one pre-release marked TEST per major
 #   - Ferdium's Electron major near/at end of support    -> issue in this repo
 # Installing is always manual: these builds are unsigned.
 
@@ -57,11 +57,16 @@ jobs:
           cat plan.json
           M=$(jq -r .M plan.json); L=$(jq -r .L plan.json)
 
-          # Skip anything already released in this repo
+          # Skip anything already released in this repo; TEST builds only once per Electron major
+          RELEASED=$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')
           TARGETS='[]'
           for row in $(jq -c '.targets[]' plan.json); do
             t=$(jq -r .tag <<<"$row")
-            if gh release view "$t" --repo "$REPO" >/dev/null 2>&1; then
+            kind=$(jq -r .kind <<<"$row")
+            major=$(jq -r '.electron | split(".")[0]' <<<"$row")
+            if [ "$kind" = "test" ] && grep -q -- "-electron-$major\." <<<"$RELEASED"; then
+              echo "TEST build for Electron $major already exists, skipping: $t"
+            elif grep -qx -- "$t" <<<"$RELEASED"; then
               echo "Already built: $t"
             else
               echo "To build: $t"
