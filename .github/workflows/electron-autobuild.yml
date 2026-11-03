@@ -7,6 +7,9 @@ name: Electron auto-build
 #                                                           while the issue is open (close it to retry)
 # TEST builds also use the newest node-abi, so electron-builder recognises new Electron majors,
 # and build Windows x64 only (Electron 45+ no longer publishes 32-bit Windows).
+# On Electron 44+ TEST builds also swap in .github/patches/electron44-clipboard.ts (writeImage removed)
+# and run an informational type-check against that Electron's API.
+# Run manually with "rebuild_test" to force a fresh TEST build even if one exists for that major.
 #   - Ferdium's Electron major near/at end of support    -> issue in this repo
 # Every build also forces patch/minor security updates of 25 shipped npm packages (2026-11-02 audit).
 #   - Normal build fails -> issue; that exact build is not retried while the issue is open.
@@ -17,6 +20,11 @@ on:
   schedule:
     - cron: '23 */6 * * *' # every 6 hours
   workflow_dispatch:
+    inputs:
+      rebuild_test:
+        description: 'Build a fresh TEST release on the newest Electron major even if one exists'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,6 +46,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      REBUILD_TEST: ${{ github.event.inputs.rebuild_test || 'false' }}
     steps:
       - name: Work out what needs building
         id: plan
@@ -76,9 +85,9 @@ jobs:
             t=$(jq -r .tag <<<"$row")
             kind=$(jq -r .kind <<<"$row")
             major=$(jq -r '.electron | split(".")[0]' <<<"$row")
-            if [ "$kind" = "test" ] && grep -q -- "-electron-$major\." <<<"$RELEASED"; then
+            if [ "$kind" = "test" ] && [ "$REBUILD_TEST" != "true" ] && grep -q -- "-electron-$major\." <<<"$RELEASED"; then
               echo "TEST build for Electron $major already exists, skipping: $t"
-            elif [ "$kind" = "test" ] && grep -q -- "+ Electron $major\." <<<"$FAILED"; then
+            elif [ "$kind" = "test" ] && [ "$REBUILD_TEST" != "true" ] && grep -q -- "+ Electron $major\." <<<"$FAILED"; then
               echo "TEST build for Electron $major already failed (see issue), skipping: $t"
             elif [ "$kind" = "patch" ] && grep -qx -- "Build failed: $t" <<<"$PATCH_FAILED"; then
               echo "Build already failed (see issue), skipping: $t"
@@ -259,6 +268,31 @@ jobs:
           pnpm lint
           pnpm test
         shell: bash
+      # Applied after lint/tests so Ferdium's ESLint rules only judge Ferdium's own code.
+      - name: Patch clipboard for Electron 44+ (TEST builds only)
+        if: matrix.kind == 'test'
+        run: |
+          set -euo pipefail
+          ELECTRON="${{ matrix.electron }}"; F=src/electron/ipc-api/clipboard.ts
+          if [ "${ELECTRON%%.*}" -ge 44 ] && grep -q "clipboard.writeImage" "$F"; then
+            curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/.github/patches/electron44-clipboard.ts" -o "$F"
+            grep -q "new ClipboardItem" "$F"
+            echo "Patched $F for the Electron 44+ clipboard API"
+          else
+            echo "No clipboard patch needed"
+          fi
+        shell: bash
+      - name: Type-check against Electron ${{ matrix.electron }} (TEST builds only, informational)
+        if: matrix.kind == 'test'
+        continue-on-error: true
+        run: |
+          set +e
+          pnpm typecheck > typecheck.log 2>&1
+          code=$?
+          echo "TypeScript errors: $(grep -c 'error TS' typecheck.log)"
+          grep 'error TS' typecheck.log | head -60
+          exit $code
+        shell: bash
       - name: Build Ferdium
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
@@ -279,7 +313,7 @@ jobs:
           if [ "${{ matrix.kind }}" = "test" ]; then
             TITLE="TEST - Ferdium ${FERDIUM#v} + Electron $ELECTRON"
             FLAGS="--prerelease"
-            NOTE="TEST build: Electron $ELECTRON is a newer major version than official Ferdium ${FERDIUM#v} was built for. Some services may break. Try it before relying on it."
+            NOTE="TEST build: Electron $ELECTRON is a newer major version than official Ferdium ${FERDIUM#v} was built for. Some services may break. Try it before relying on it. Back up your Ferdium profile first: Chromium upgrades it, and an older build may not read it afterwards. On Electron 44+ the clipboard handler is patched for the new clipboard API."
           else
             TITLE="Ferdium ${FERDIUM#v} + Electron $ELECTRON + npm fixes r$NPM_FIX_REV"
             FLAGS="--latest"
