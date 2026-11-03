@@ -1,14 +1,17 @@
 name: Electron auto-build
 
 # Rebuilds the newest official Ferdium release on every new Electron version.
-#   - New patch of the Electron major Ferdium ships with -> normal release (safe to install)
-#   - Newer Electron major                               -> one pre-release marked TEST per major
+# The "line" is the Electron major normal builds use: ELECTRON_LINE below, or the major
+# official Ferdium ships with if that is newer.
+#   - New patch of the line's Electron major             -> normal release (safe to install)
+#   - Electron major newer than the line                 -> one pre-release marked TEST per major
 #   - TEST build fails                                   -> issue; that major is not retried
 #                                                           while the issue is open (close it to retry)
-# TEST builds also use the newest node-abi, so electron-builder recognises new Electron majors,
-# and build Windows x64 only (Electron 45+ no longer publishes 32-bit Windows).
-# On Electron 44+ TEST builds also swap in .github/patches/electron44-clipboard.ts (writeImage removed)
-# and run an informational type-check against that Electron's API.
+# Any build on a newer Electron major than Ferdium ships with ("compat" builds) also uses the
+# newest node-abi, so electron-builder recognises the new major, and builds Windows x64 only
+# (Electron 45+ no longer publishes 32-bit Windows). On Electron 44+ it swaps in
+# .github/patches/electron44-clipboard.ts (writeImage removed) and runs an informational
+# type-check against that Electron's API.
 # Run manually with "rebuild_test" to force a fresh TEST build even if one exists for that major.
 #   - Ferdium's Electron major near/at end of support    -> issue in this repo
 # Every build also forces patch/minor security updates of 25 shipped npm packages (2026-11-02 audit).
@@ -36,6 +39,8 @@ concurrency:
 
 env:
   NPM_FIX_REV: '1'
+  # Electron major for normal builds (user switched to 45 on 2026-11-02 after trialling Chrome 156)
+  ELECTRON_LINE: '45'
 
 jobs:
   check:
@@ -63,15 +68,20 @@ jobs:
           const cmp = (a, b) => { const x = parse(a), y = parse(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
           const stable = JSON.parse(fs.readFileSync('versions.json')).filter(v => /^\d+\.\d+\.\d+$/.test(v)).sort(cmp);
           const shipped = process.env.SHIPPED, tag = process.env.FERDIUM_TAG;
-          const M = parse(shipped)[0];
+          const S = parse(shipped)[0];                                  // major official Ferdium ships
+          const M = Math.max(S, parseInt(process.env.ELECTRON_LINE || '0', 10)); // the build line
           const L = parse(stable[stable.length - 1])[0];
           const newest = major => stable.filter(v => parse(v)[0] === major).pop();
           const targets = [];
           const patch = newest(M);
-          if (cmp(patch, shipped) > 0) targets.push({ electron: patch, kind: 'patch' });
+          if (patch && (M > S || cmp(patch, shipped) > 0)) targets.push({ electron: patch, kind: 'patch' });
           if (L > M) targets.push({ electron: newest(L), kind: 'test' });
-          for (const t of targets) { t.ferdium = tag; t.tag = `ferdium-${tag}-electron-${t.electron}-npmfix${process.env.NPM_FIX_REV}`; }
-          console.log(JSON.stringify({ shipped, M, L, targets }));
+          for (const t of targets) {
+            t.ferdium = tag;
+            t.compat = parse(t.electron)[0] > S;
+            t.tag = `ferdium-${tag}-electron-${t.electron}-npmfix${process.env.NPM_FIX_REV}`;
+          }
+          console.log(JSON.stringify({ shipped, S, M, L, targets }));
           EOF
           cat plan.json
           M=$(jq -r .M plan.json); L=$(jq -r .L plan.json)
@@ -109,10 +119,10 @@ jobs:
           # Electron supports its latest three stable majors.
           if [ "$M" -lt $((L - 2)) ]; then
             TITLE="Electron $M is no longer supported"
-            BODY="Official Ferdium still ships Electron $M, but Electron now only patches $((L - 2))-$L. Patch builds have stopped; use the newest TEST build or wait for a Ferdium release on a supported Electron."
+            BODY="Normal builds use Electron $M, but Electron now only patches $((L - 2))-$L. Patch builds have stopped; raise ELECTRON_LINE in the workflow or use the newest TEST build."
           elif [ "$M" -eq $((L - 2)) ]; then
             TITLE="Electron $M support ends when Electron $((L + 1)) ships"
-            BODY="Official Ferdium ships Electron $M, the oldest major Electron still patches. Dates: https://releases.electronjs.org/schedule"
+            BODY="Normal builds use Electron $M, the oldest major Electron still patches. Dates: https://releases.electronjs.org/schedule"
           else
             exit 0
           fi
@@ -175,17 +185,17 @@ jobs:
         run: npm pkg set "devDependencies.electron=${{ matrix.electron }}"
         shell: bash
       # Ferdium's pinned node-abi may predate a new Electron major; electron-builder then fails
-      # with "Could not detect abi". Patch builds keep Ferdium's own version.
-      - name: Use newest node-abi (TEST builds only)
-        if: matrix.kind == 'test'
+      # with "Could not detect abi". Builds on Ferdium's own major keep Ferdium's version.
+      - name: Use newest node-abi (compat builds only)
+        if: matrix.compat
         run: |
           V=$(npm view node-abi version)
           sed -i "/^overrides:/a\\  node-abi: $V" pnpm-workspace.yaml
           echo "node-abi override: $V"
         shell: bash
       # Electron 45 dropped 32-bit Windows; only the x64 installer is published anyway.
-      - name: Build Windows x64 only (TEST builds only)
-        if: matrix.kind == 'test'
+      - name: Build Windows x64 only (compat builds only)
+        if: matrix.compat
         run: |
           sed -i 's/arch: \[x64, ia32, arm64\]/arch: [x64]/' electron-builder.yml
           grep -n "arch: \[x64\]" electron-builder.yml
@@ -269,8 +279,8 @@ jobs:
           pnpm test
         shell: bash
       # Applied after lint/tests so Ferdium's ESLint rules only judge Ferdium's own code.
-      - name: Patch clipboard for Electron 44+ (TEST builds only)
-        if: matrix.kind == 'test'
+      - name: Patch clipboard for Electron 44+ (compat builds only)
+        if: matrix.compat
         run: |
           set -euo pipefail
           ELECTRON="${{ matrix.electron }}"; F=src/electron/ipc-api/clipboard.ts
@@ -282,8 +292,8 @@ jobs:
             echo "No clipboard patch needed"
           fi
         shell: bash
-      - name: Type-check against Electron ${{ matrix.electron }} (TEST builds only, informational)
-        if: matrix.kind == 'test'
+      - name: Type-check against Electron ${{ matrix.electron }} (compat builds only, informational)
+        if: matrix.compat
         continue-on-error: true
         run: |
           set +e
@@ -317,7 +327,11 @@ jobs:
           else
             TITLE="Ferdium ${FERDIUM#v} + Electron $ELECTRON + npm fixes r$NPM_FIX_REV"
             FLAGS="--latest"
-            NOTE="Official Ferdium ${FERDIUM#v} source with Electron updated to $ELECTRON (security and bug-fix patch of the same major version)."
+            if [ "${{ matrix.compat }}" = "true" ]; then
+              NOTE="Official Ferdium ${FERDIUM#v} source on Electron $ELECTRON, the newest patch of this fork's Electron line (a newer major than official Ferdium ships, with the Electron 44+ clipboard patch). Do not install a build on an older Electron major over this profile."
+            else
+              NOTE="Official Ferdium ${FERDIUM#v} source with Electron updated to $ELECTRON (security and bug-fix patch of the same major version)."
+            fi
           fi
           printf '%s\n\nAlso forces patch/minor security updates of 25 shipped npm packages (override list r%s in the workflow). Ferdium'"'"'s lint and tests passed with them.\n\nInstall: download Ferdium-win-AutoSetup-*-x64.exe and run it. The build is unsigned, so at the SmartScreen warning click More info, then Run anyway.\n\nBuilt from https://github.com/ferdium/ferdium-app/tree/%s; only the Electron version and those npm package versions changed.\n' "$NOTE" "$NPM_FIX_REV" "$FERDIUM" > notes.md
           gh release create "${{ matrix.tag }}" out/Ferdium-win-AutoSetup-*-x64.exe \
