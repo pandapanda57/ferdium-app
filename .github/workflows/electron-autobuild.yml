@@ -8,6 +8,9 @@ name: Electron auto-build
 # TEST builds also use the newest node-abi, so electron-builder recognises new Electron majors,
 # and build Windows x64 only (Electron 45+ no longer publishes 32-bit Windows).
 #   - Ferdium's Electron major near/at end of support    -> issue in this repo
+# Every build also forces patch/minor security updates of 25 shipped npm packages (2026-11-02 audit).
+#   - Normal build fails -> issue; that exact build is not retried while the issue is open.
+#   - Bump NPM_FIX_REV after changing the override list, to rebuild with the new list.
 # Installing is always manual: these builds are unsigned.
 
 on:
@@ -22,6 +25,9 @@ permissions:
 concurrency:
   group: electron-autobuild
   cancel-in-progress: false
+
+env:
+  NPM_FIX_REV: '1'
 
 jobs:
   check:
@@ -55,7 +61,7 @@ jobs:
           const patch = newest(M);
           if (cmp(patch, shipped) > 0) targets.push({ electron: patch, kind: 'patch' });
           if (L > M) targets.push({ electron: newest(L), kind: 'test' });
-          for (const t of targets) { t.ferdium = tag; t.tag = `ferdium-${tag}-electron-${t.electron}`; }
+          for (const t of targets) { t.ferdium = tag; t.tag = `ferdium-${tag}-electron-${t.electron}-npmfix${process.env.NPM_FIX_REV}`; }
           console.log(JSON.stringify({ shipped, M, L, targets }));
           EOF
           cat plan.json
@@ -64,6 +70,7 @@ jobs:
           # Skip anything already released in this repo; TEST builds only once per Electron major
           RELEASED=$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')
           FAILED=$(gh issue list --repo "$REPO" --state open --limit 1000 --json title --jq '.[].title | select(startswith("TEST build failed:"))')
+          PATCH_FAILED=$(gh issue list --repo "$REPO" --state open --limit 1000 --json title --jq '.[].title | select(startswith("Build failed: "))')
           TARGETS='[]'
           for row in $(jq -c '.targets[]' plan.json); do
             t=$(jq -r .tag <<<"$row")
@@ -73,6 +80,8 @@ jobs:
               echo "TEST build for Electron $major already exists, skipping: $t"
             elif [ "$kind" = "test" ] && grep -q -- "+ Electron $major\." <<<"$FAILED"; then
               echo "TEST build for Electron $major already failed (see issue), skipping: $t"
+            elif [ "$kind" = "patch" ] && grep -qx -- "Build failed: $t" <<<"$PATCH_FAILED"; then
+              echo "Build already failed (see issue), skipping: $t"
             elif grep -qx -- "$t" <<<"$RELEASED"; then
               echo "Already built: $t"
             else
@@ -172,6 +181,42 @@ jobs:
           sed -i 's/arch: \[x64, ia32, arm64\]/arch: [x64]/' electron-builder.yml
           grep -n "arch: \[x64\]" electron-builder.yml
         shell: bash
+      # Patch/minor security updates for shipped npm packages (OSV audit, 2026-11-02).
+      # "name@major" limits each override to that major; "^" never downgrades a newer Ferdium pin.
+      - name: Apply npm security overrides
+        run: |
+          set -euo pipefail
+          grep -q '^overrides:' pnpm-workspace.yaml || printf '\noverrides:\n' >> pnpm-workspace.yaml
+          while read -r key ver; do
+            [ -z "$key" ] && continue
+            sed -i "/^overrides:/a\\  '$key': '^$ver'" pnpm-workspace.yaml
+          done <<'LIST'
+          proxy-addr@2 2.0.8
+          brace-expansion@1 1.1.21
+          brace-expansion@2 2.1.7
+          immutable@4 4.3.9
+          cross-spawn@6 6.0.6
+          jws@3 3.2.3
+          picomatch@2 2.3.2
+          yaml@1 1.10.3
+          darkreader@4 4.9.117
+          js-yaml@4 4.3.2
+          multiparty@4 4.3.0
+          @remix-run/router@1 1.23.3
+          builder-util-runtime@9 9.7.0
+          lodash@4 4.18.0
+          lodash-es@4 4.18.0
+          validator@13 13.15.22
+          @babel/runtime@7 7.26.10
+          @octokit/request@8 8.4.1
+          @octokit/request-error@5 5.1.1
+          @sentry/browser@7 7.119.1
+          moment@2 2.31.0
+          qs@6 6.16.1
+          serve-static@1 1.16.0
+          LIST
+          sed -n '/^overrides:/,/^[^ ]/p' pnpm-workspace.yaml
+        shell: bash
       - name: Install node dependencies
         uses: nick-fields/retry@v3
         with:
@@ -181,6 +226,25 @@ jobs:
           retry_on: error
       - name: Show node-abi in use
         run: grep -oE "node-abi@[0-9.]+" pnpm-lock.yaml | sort -u
+        shell: bash
+      - name: Confirm no vulnerable version is left
+        run: |
+          set -euo pipefail
+          bad=0
+          for old in proxy-addr@2.0.7 brace-expansion@1.1.11 brace-expansion@2.0.1 immutable@4.3.7 cross-spawn@6.0.5 \
+                     jws@3.2.2 picomatch@2.3.1 yaml@1.10.2 darkreader@4.9.96 js-yaml@4.1.0 multiparty@4.2.3 \
+                     @remix-run/router@1.17.1 builder-util-runtime@9.2.10 lodash@4.17.21 lodash-es@4.17.21 \
+                     validator@13.12.0 @babel/runtime@7.23.5 @babel/runtime@7.23.9 @babel/runtime@7.24.4 \
+                     @octokit/request@8.1.6 @octokit/request-error@5.0.1 @sentry/browser@7.74.0 moment@2.30.1 \
+                     qs@6.11.0 serve-static@1.15.0; do
+            if grep -qE "^  '?${old//./\\.}'?:" pnpm-lock.yaml; then echo "STILL PRESENT: $old"; bad=1; fi
+          done
+          for p in proxy-addr brace-expansion immutable cross-spawn jws picomatch yaml darkreader js-yaml multiparty \
+                   @remix-run/router builder-util-runtime lodash lodash-es validator @babel/runtime @octokit/request \
+                   @octokit/request-error @sentry/browser moment qs serve-static; do
+            echo "$p: $(grep -oE "^  '?${p//./\\.}@[0-9][^':(]*" pnpm-lock.yaml | sed -E "s/^  '?//" | sort -u | tr '\n' ' ')"
+          done
+          exit $bad
         shell: bash
       - name: Package recipes
         run: |
@@ -217,11 +281,11 @@ jobs:
             FLAGS="--prerelease"
             NOTE="TEST build: Electron $ELECTRON is a newer major version than official Ferdium ${FERDIUM#v} was built for. Some services may break. Try it before relying on it."
           else
-            TITLE="Ferdium ${FERDIUM#v} + Electron $ELECTRON"
+            TITLE="Ferdium ${FERDIUM#v} + Electron $ELECTRON + npm fixes r$NPM_FIX_REV"
             FLAGS="--latest"
             NOTE="Official Ferdium ${FERDIUM#v} source with Electron updated to $ELECTRON (security and bug-fix patch of the same major version)."
           fi
-          printf '%s\n\nInstall: download Ferdium-win-AutoSetup-*-x64.exe and run it. The build is unsigned, so at the SmartScreen warning click More info, then Run anyway.\n\nBuilt from https://github.com/ferdium/ferdium-app/tree/%s with only the Electron version changed.\n' "$NOTE" "$FERDIUM" > notes.md
+          printf '%s\n\nAlso forces patch/minor security updates of 25 shipped npm packages (override list r%s in the workflow). Ferdium'"'"'s lint and tests passed with them.\n\nInstall: download Ferdium-win-AutoSetup-*-x64.exe and run it. The build is unsigned, so at the SmartScreen warning click More info, then Run anyway.\n\nBuilt from https://github.com/ferdium/ferdium-app/tree/%s; only the Electron version and those npm package versions changed.\n' "$NOTE" "$NPM_FIX_REV" "$FERDIUM" > notes.md
           gh release create "${{ matrix.tag }}" out/Ferdium-win-AutoSetup-*-x64.exe \
             --repo "${{ github.repository }}" \
             --target "${{ github.event.repository.default_branch }}" \
@@ -236,3 +300,11 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           printf 'The TEST build of Ferdium %s on Electron %s failed, so no TEST release was published.\n\nElectron %s will not be TEST-built again while this issue is open. Close it to allow a retry.\n\nBuild log: %s\n' "${FERDIUM#v}" "$ELECTRON" "$MAJOR" "$RUN_URL" > issue.md
           gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body-file issue.md
+      - name: Open an issue for a failed normal build
+        if: failure() && matrix.kind == 'patch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          printf 'The normal build %s failed, so no release was published. A likely cause is one of the forced npm security updates.\n\nThis exact build will not be retried while this issue is open. Close it to allow a retry.\n\nBuild log: %s\n' "${{ matrix.tag }}" "$RUN_URL" > issue.md
+          gh issue create --repo "${{ github.repository }}" --title "Build failed: ${{ matrix.tag }}" --body-file issue.md
